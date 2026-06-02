@@ -1,23 +1,23 @@
-# 🎓 Text-to-Audio Summarizer (Final Year Project)
+# Text-to-Audio Summarizer (Final Year Project)
 
-## 📌 Overview
+## Mini Intro
 
 This project is an NLP-based system developed as part of my undergraduate final year project. It allows users to upload PDF or Word documents, automatically summarizes the content using cosine similarity, and generates an audio version of the summary in the document’s original language.
 The goal is to help students quickly understand large volumes of text through concise summaries and audio playback.
 
 ---
 
-## ✨ Features
+## Features
 
-* 📄 Upload and process PDF/Word documents
-* 🧠 Text summarization using cosine similarity
-* 🔊 Text-to-Speech (TTS) audio generation
-* 🌍 Language detection and translation support
-* ⚡ Efficient handling of large documents
+* Upload and process PDF/Word documents
+* Text summarization using cosine similarity
+* Text-to-Speech (TTS) audio generation
+* Language detection and translation support
+* Efficient handling of large documents
 
 ---
 
-## 🛠️ Tech Stack / Libraries
+## Libraries
 
 The project uses the following Python libraries:
 
@@ -37,7 +37,7 @@ The project uses the following Python libraries:
 
 ---
 
-## ⚙️ How It Works
+## How It Works
 
 1. User uploads a document (PDF or Word)
 2. Text is extracted from the file
@@ -50,7 +50,7 @@ The project uses the following Python libraries:
 
 ---
 
-## 🚀 Installation
+## Installation
 
 ```bash
 git clone https://github.com/th3realAyo/nlp-text-to-speech-summarization-system.git
@@ -60,22 +60,15 @@ pip install -r requirements.txt
 
 ---
 
-## ▶️ Usage
+## Usage
 
 ```bash
 python main.py
 ```
 
-Or run via Jupyter Notebook if applicable.
-
 ---
 
-## 🎯 Project Objective
-To improve learning efficiency by transforming lengthy academic documents into short, easy-to-understand audio summaries.
-
----
-
-## 📚 Future Improvements
+## Future Improvements
 
 * Improve summarization using transformer-based models
 * Add real-time streaming audio output
@@ -84,6 +77,5 @@ To improve learning efficiency by transforming lengthy academic documents into s
 
 ---
 
-## 👨‍🎓 Author
+## Author
 Adegunte Damilola
-
