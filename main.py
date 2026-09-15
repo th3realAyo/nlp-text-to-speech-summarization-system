@@ -1,80 +1,251 @@
+"""
+main.py
+
+Streamlit app for the grounded RAG PDF/Word summarizer.
+
+Flow:
+    1. Upload PDF/Word -> extract text (doc_loader.py) -> detect language
+    2. User picks how much of the document to summarize (%)
+    3. Grounded summary generated (grounded_summarizer.py, via Modal) with
+       per-section citations back to source page/excerpt
+    4. User reviews the summary and confirms before moving to audio
+    5. User picks audio language + voice
+    6. If audio language != summary language, translate via Modal first
+    7. Route to ElevenLabs (English) or YarnGPT via Modal (Yoruba/Igbo/Hausa)
+"""
+from dotenv import load_dotenv
+
+load_dotenv()
+import base64
+import os
+import tempfile
+
+import requests
 import streamlit as st
-import pdfplumber as pf
-from clean import TTSPreprocessor
-from summarize import TextSummarizer, MultilingualProcessor
-from converttospeech import convert_text_to_audio
+from langdetect import detect
+
+from doc_loader import DocumentExtractionError, UnsupportedFileTypeError, extract_document
+from elevenlabs_tts import ElevenLabsTTSError, synthesize_with_elevenlabs
+from grounded_summarizer import GroundedSummarizerError, LANGUAGE_NAMES, generate_grounded_summary
+
+MODAL_TRANSLATE_URL = os.environ.get("MODAL_TRANSLATE_URL")
+MODAL_YARNGPT_URL = os.environ.get("MODAL_YARNGPT_URL")
+RAG_AUTH_TOKEN = os.environ.get("RAG_AUTH_TOKEN")
+
+SUPPORTED_AUDIO_LANGUAGES = ["English", "Yoruba", "Igbo", "Hausa"]
+
+# Same voice list as modal_app.py's YARNGPT_VOICES — kept as a plain
+# constant here too since it's static data not worth a Modal round trip
+# just to list it. "yoruba_feamle1" / "hausa_feamle1" are typos in the
+# upstream YarnGPT2 model itself, not here — preserved as-is since they're
+# the actual required speaker_name values.
+YARNGPT_VOICES = {
+    "yoruba": ["yoruba_male2", "yoruba_female2", "yoruba_feamle1"],
+    "igbo": ["igbo_female2", "igbo_male2", "igbo_female1"],
+    "hausa": ["hausa_feamle1", "hausa_female2", "hausa_male2", "hausa_male1"],
+}
+
+ELEVENLABS_VOICES = ["Rachel", "Adam", "Bella", "Antoni", "Josh"]
+
+TOP_N_MIN, TOP_N_MAX = 3, 15
 
 
+def save_uploaded_file(uploaded_file) -> str:
+    """Streamlit's UploadedFile is file-like but doc_loader.py works off a
+    path, so write it to a temp file first."""
+    suffix = os.path.splitext(uploaded_file.name)[1]
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp.write(uploaded_file.getvalue())
+        return tmp.name
 
-processor = TTSPreprocessor()
-multi_processor = MultilingualProcessor()
-english_summarizer = TextSummarizer()
 
-def extract_text(pdf_file):
-    '''
-    This function helps extract pdf content, especially text from a given pdf file.
-    '''
-
+def detect_document_language(sample_text: str) -> str:
     try:
-        extract_text = ""
-        with pf.open(pdf_file) as pdf:
-            for page_num, page in enumerate(pdf.pages, start=1):
-                print(f'Processing for page {page_num}'.upper())
-                print('====' * 20)
-                text = page.extract_text()
-                if text:
-                    extract_text += text
-        return extract_text
-    except Exception as E:
-        st.error(f'An error occured proccessing: {E}')
-        return str(E)
-        
+        return detect(sample_text[:2000])
+    except Exception:
+        return "en"
+
+
+def call_modal_translate(text: str, target_language: str) -> str:
+    response = requests.post(
+        MODAL_TRANSLATE_URL,
+        json={"text": text, "target_language": target_language},
+        headers={"Authorization": f"Bearer {RAG_AUTH_TOKEN}"},
+        timeout=90,
+    )
+    response.raise_for_status()
+    return response.json()["translated_text"]
+
+
+def call_modal_yarngpt(text: str, language: str, speaker_name: str) -> bytes:
+    response = requests.post(
+        MODAL_YARNGPT_URL,
+        json={"text": text, "language": language, "speaker_name": speaker_name},
+        headers={"Authorization": f"Bearer {RAG_AUTH_TOKEN}"},
+        timeout=180,
+    )
+    response.raise_for_status()
+    audio_b64 = response.json()["audio_base64"]
+    return base64.b64decode(audio_b64)
+
+
+def render_citations(sections):
+    for i, section in enumerate(sections, start=1):
+        with st.expander(f"Section {i} — source: {section.location_label}"):
+            st.markdown(f"**Summary:** {section.summary_text}")
+            st.markdown("**Original excerpt:**")
+            st.caption(section.source_excerpt)
+
+
+def reset_downstream_state():
+    for key in ["segments", "language_code", "summary_result", "confirmed"]:
+        st.session_state.pop(key, None)
+
+
 def main():
-    st.title("PDF Text to Audio Converter")
+    st.title("Grounded PDF/Word Summarizer")
+    st.caption("Every summary section is traceable to the exact passage it came from.")
 
-    uploaded_file = st.file_uploader("Choose a PDF file", type="pdf")
+    uploaded_file = st.file_uploader("Upload a PDF or Word document", type=["pdf", "docx"])
 
-    if uploaded_file is not None:
-        st.success('File Uploaded Successfully')
-        
-        with st.spinner("Extracting text from PDF..."):
-            text = extract_text(uploaded_file)
+    if uploaded_file is None:
+        return
 
-        if text:
-            with st.spinner("Processing text..."):
-                
-                lang_code, lang_name = multi_processor.detect_language(text)
-                # st.write(lang_name)
-    
+    # New file uploaded -> wipe any previous document's state
+    if st.session_state.get("processed_filename") != uploaded_file.name:
+        reset_downstream_state()
+        st.session_state.processed_filename = uploaded_file.name
 
-                if lang_code == 'en':
-                    text = processor.process_text(text)
-                    text = english_summarizer.extractive_summarize(text)
+    if "segments" not in st.session_state:
+        with st.spinner("Extracting document text..."):
+            temp_path = save_uploaded_file(uploaded_file)
+            try:
+                segments = extract_document(temp_path)
+            except (UnsupportedFileTypeError, DocumentExtractionError) as e:
+                st.error(str(e))
+                return
+            finally:
+                os.unlink(temp_path)
+
+            sample_text = " ".join(seg.text for seg in segments[:3])
+            language_code = detect_document_language(sample_text)
+
+        st.session_state.segments = segments
+        st.session_state.language_code = language_code
+
+    segments = st.session_state.segments
+    language_code = st.session_state.language_code
+    language_name = LANGUAGE_NAMES.get(language_code, "English")
+
+    st.success(f"Extracted {len(segments)} section(s). Detected document language: {language_name}")
+
+    st.subheader("1. How much of the document should be summarized?")
+    percentage = st.slider(
+        "Percentage of document to summarize", min_value=10, max_value=80, value=30, step=10
+    )
+
+    if st.button("Generate grounded summary"):
+        # Rough heuristic: pages get split into smaller chunks downstream,
+        # so scale up a bit from raw section count. Tune the *2 multiplier
+        # if summaries come out consistently too long/short for a given %.
+        approx_chunks = round((percentage / 100) * len(segments) * 2)
+        top_n = max(TOP_N_MIN, min(TOP_N_MAX, approx_chunks))
+
+        with st.spinner(
+            "Ranking passages and generating the grounded summary... "
+            "first run can take a minute (model cold start on Modal)."
+        ):
+            try:
+                result = generate_grounded_summary(
+                    segments, language_code=language_code, top_n=top_n
+                )
+            except GroundedSummarizerError as e:
+                st.error(f"Summarization failed: {e}")
+                return
+            except requests.RequestException as e:
+                st.error(f"Could not reach the summarization service: {e}")
+                return
+
+        st.session_state.summary_result = result
+        st.session_state.confirmed = False
+
+    if "summary_result" not in st.session_state:
+        return
+
+    result = st.session_state.summary_result
+
+    st.subheader("2. Review your grounded summary")
+    if result.skipped_chunks:
+        st.caption(f"Note: {result.skipped_chunks} section(s) couldn't be summarized and were skipped.")
+
+    st.write(result.full_text)
+
+    st.markdown("**Citations — see exactly where each part came from:**")
+    render_citations(result.sections)
+
+    st.subheader("3. Happy with this summary?")
+    confirmed = st.checkbox(
+        "Yes, I'm satisfied with this summary — let's make the audio",
+        value=st.session_state.get("confirmed", False),
+    )
+    st.session_state.confirmed = confirmed
+
+    if not confirmed:
+        st.info("Review the summary above, or adjust the % and regenerate, before moving to audio.")
+        return
+
+    st.subheader("4. Audio options")
+    audio_language = st.selectbox("Audio language", SUPPORTED_AUDIO_LANGUAGES)
+
+    if audio_language == "English":
+        voice_options = ELEVENLABS_VOICES
+    else:
+        voice_options = YARNGPT_VOICES[audio_language.lower()]
+
+    voice = st.selectbox("Voice", voice_options)
+
+    if st.button("Generate audio"):
+        text_for_audio = result.full_text
+
+        if audio_language.lower() != language_name.lower():
+            with st.spinner(f"Translating summary into {audio_language}..."):
+                try:
+                    text_for_audio = call_modal_translate(result.full_text, audio_language)
+                except requests.RequestException as e:
+                    st.error(f"Translation failed: {e}")
+                    return
+
+        with st.spinner("Synthesizing audio... first run can take a while (model cold start)."):
+            try:
+                if audio_language == "English":
+                    audio_bytes = synthesize_with_elevenlabs(text_for_audio, voice_name=voice)
+                    audio_format = "audio/mpeg"
+                    file_ext = "mp3"
                 else:
-                    text = multi_processor.summarize_multilingual(text)
+                    audio_bytes = call_modal_yarngpt(
+                        text_for_audio, audio_language.lower(), voice
+                    )
+                    audio_format = "audio/wav"
+                    file_ext = "wav"
+            except ElevenLabsTTSError as e:
+                st.error(
+                    f"ElevenLabs failed: {e}. There is currently no backup engine for "
+                    "English audio if ElevenLabs is unavailable — this is a known gap."
+                )
+                return
+            except requests.RequestException as e:
+                st.error(f"Audio generation failed: {e}")
+                return
 
-            st.text_area('Extracted and Summarized Text', value=text, height=300)
-
-            if st.button('Convert to Audio'):
-                with st.spinner("Converting text to audio..."):
-                    audio_file_path = convert_text_to_audio(text, lang=lang_code)
-                
-                st.write('Detected Language:', lang_name)
-                
-                if audio_file_path:
-                    st.audio(audio_file_path, format='audio/mp3')
-                    st.success("Audio conversion completed successfully!")
-                    with open(audio_file_path, "rb") as file:
-                        btn = st.download_button(
-                            label="Download Audio",
-                            data=file,
-                            file_name="output.mp3",
-                            mime="audio/mp3",
-                        )
-        else:
-            st.warning('No text found in the PDF.')
+        st.success("Audio ready!")
+        st.audio(audio_bytes, format=audio_format)
+        st.download_button(
+            "Download audio",
+            data=audio_bytes,
+            file_name=f"summary_{audio_language.lower()}.{file_ext}",
+            mime=audio_format,
+        )
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
-
